@@ -233,8 +233,24 @@
         return questions;
     }
 
-    async function callGemini(prompt, retryCount = 0) {
+    async function callGeminiBatch(questions, retryCount = 0) {
         if (state.shouldCancel) throw new Error('Cancelled');
+
+        // Build a simpler, clearer prompt
+        const questionLines = questions.map((q, i) => {
+            let line = `${i + 1}. ${q.text}`;
+            if (q.options.length > 0) {
+                line += ` [${q.options.map(o => o.text).join(', ')}]`;
+            }
+            return line;
+        }).join('\n');
+
+        const systemPrompt = `Answer these ${questions.length} questions. Return ONLY a JSON array with ${questions.length} short answers.
+Example: ["answer1", "answer2", "answer3"]
+
+For multiple choice: pick one option exactly as written.
+For checkboxes: pick one or more options, comma-separated.
+For text: give a short answer.`;
 
         try {
             const response = await fetch(
@@ -245,12 +261,12 @@
                     body: JSON.stringify({
                         contents: [{
                             parts: [{
-                                text: `You are a helpful assistant. Answer the following question concisely. For multiple choice questions, respond with ONLY the exact text of one correct option. For short answers, give a brief response.\n\nQuestion: ${prompt}`
+                                text: `${systemPrompt}\n\n${questionLines}`
                             }]
                         }],
                         generationConfig: {
-                            temperature: 0.7,
-                            maxOutputTokens: 500
+                            temperature: 0.1,
+                            maxOutputTokens: 4096
                         }
                     })
                 }
@@ -258,52 +274,87 @@
             
             if (response.status === 429) {
                 if (retryCount < (CONFIG.MAX_RETRIES || 3) && !state.shouldCancel) {
-                    log(`Rate limited (429). Retrying in ${CONFIG.RETRY_DELAY / 1000}s...`, 'error');
+                    log(`Rate limited. Waiting ${CONFIG.RETRY_DELAY / 1000}s...`, 'error');
                     await delay(CONFIG.RETRY_DELAY || 5000);
                     if (state.shouldCancel) throw new Error('Cancelled');
-                    return await callGemini(prompt, retryCount + 1);
+                    return await callGeminiBatch(questions, retryCount + 1);
                 } else {
-                    throw new Error(state.shouldCancel ? 'Cancelled' : 'Rate limit exceeded after multiple retries.');
+                    throw new Error(state.shouldCancel ? 'Cancelled' : 'Rate limit exceeded.');
                 }
             }
 
             const data = await response.json();
             
             if (data.candidates && data.candidates[0] && data.candidates[0].content) {
-                return data.candidates[0].content.parts[0].text.trim();
+                let text = data.candidates[0].content.parts[0].text.trim();
+                
+                // Clean common issues
+                text = text.replace(/```json\n?/g, '').replace(/\n?```/g, '');
+                
+                // Try direct JSON parse
+                try {
+                    const parsed = JSON.parse(text);
+                    if (Array.isArray(parsed)) {
+                        while (parsed.length < questions.length) parsed.push("");
+                        return parsed.slice(0, questions.length);
+                    }
+                } catch (e) {}
+                
+                // Try extracting array with greedy regex
+                const arrayMatch = text.match(/\[[\s\S]*\]/);
+                if (arrayMatch) {
+                    try {
+                        const parsed = JSON.parse(arrayMatch[0]);
+                        if (Array.isArray(parsed)) {
+                            while (parsed.length < questions.length) parsed.push("");
+                            return parsed.slice(0, questions.length);
+                        }
+                    } catch (e) {}
+                }
+                
+                // Fallback: try to fix truncated JSON by adding closing bracket
+                if (text.startsWith('[') && !text.endsWith(']')) {
+                    // Find last complete string and close the array
+                    const lastQuoteIndex = text.lastIndexOf('"');
+                    if (lastQuoteIndex > 0) {
+                        const fixedText = text.substring(0, lastQuoteIndex + 1) + ']';
+                        try {
+                            const parsed = JSON.parse(fixedText);
+                            if (Array.isArray(parsed)) {
+                                log(`Recovered ${parsed.length} answers from truncated response`, 'info');
+                                while (parsed.length < questions.length) parsed.push("");
+                                return parsed.slice(0, questions.length);
+                            }
+                        } catch (e) {}
+                    }
+                }
+                
+                // Ultimate fallback: extract all quoted strings
+                const quotedStrings = text.match(/"([^"\\]*(\\.[^"\\]*)*)"/g);
+                if (quotedStrings && quotedStrings.length > 0) {
+                    const answers = quotedStrings.map(s => s.slice(1, -1)); // Remove quotes
+                    log(`Extracted ${answers.length} answers from raw text`, 'info');
+                    while (answers.length < questions.length) answers.push("");
+                    return answers.slice(0, questions.length);
+                }
+                
+                if (CONFIG.DEBUG) console.log('[AI Helper] Raw AI response:', text.substring(0, 500));
+                
+                log('Invalid AI format. Retrying...', 'error');
+                if (retryCount < 2) return await callGeminiBatch(questions, retryCount + 1);
             }
             
-            throw new Error('Invalid response from Gemini: ' + JSON.stringify(data));
+            throw new Error('Invalid response from AI');
         } catch (error) {
             if (error.message === 'Cancelled') throw error;
-            
             if (retryCount < (CONFIG.MAX_RETRIES || 3) && !state.shouldCancel) {
                 log(`Error: ${error.message}. Retrying...`, 'error');
                 await delay(CONFIG.RETRY_DELAY || 5000);
                 if (state.shouldCancel) throw new Error('Cancelled');
-                return await callGemini(prompt, retryCount + 1);
+                return await callGeminiBatch(questions, retryCount + 1);
             }
             throw error;
         }
-    }
-
-    function buildPrompt(question) {
-        let prompt = question.text;
-        
-        if (question.options.length > 0) {
-            prompt += '\n\nOptions:\n';
-            question.options.forEach((opt, i) => {
-                prompt += `${i + 1}. ${opt.text}\n`;
-            });
-            
-            if (question.type === 'checkbox') {
-                prompt += '\nThis is a checkbox question. You can select multiple options. List all correct options separated by commas.';
-            } else {
-                prompt += '\nRespond with ONLY the exact text of the correct option.';
-            }
-        }
-        
-        return prompt;
     }
 
     async function fillQuestion(question, answer) {
@@ -365,22 +416,31 @@
     }
 
     function checkAnswered(question) {
-        switch (question.type) {
-            case 'multiple_choice':
-                return Array.from(question.options).some(opt => opt.element.getAttribute('aria-checked') === 'true');
-            case 'checkbox':
-                return Array.from(question.options).some(opt => opt.element.getAttribute('aria-checked') === 'true');
-            case 'short_answer':
-            case 'paragraph':
-                return question.inputElement && question.inputElement.value.trim() !== '';
-            case 'dropdown':
-                if (question.dropdownElement) {
-                    const selectedValue = question.dropdownElement.getAttribute('data-value');
-                    return selectedValue && selectedValue !== '';
-                }
-                return false;
-            default:
-                return false;
+        try {
+            switch (question.type) {
+                case 'multiple_choice':
+                case 'checkbox':
+                    return question.options.some(opt => {
+                        const isChecked = opt.element.getAttribute('aria-checked') === 'true';
+                        const parentChecked = opt.element.parentElement?.getAttribute('aria-checked') === 'true';
+                        return isChecked || parentChecked;
+                    });
+                case 'short_answer':
+                case 'paragraph':
+                    return question.inputElement && question.inputElement.value.trim() !== '';
+                case 'dropdown':
+                    if (question.dropdownElement) {
+                        const selectedValue = question.dropdownElement.getAttribute('data-value');
+                        const text = question.dropdownElement.textContent.trim();
+                        // Usually has a generic text like "Choose" or "เลือก" if empty
+                        return selectedValue && selectedValue !== '' && !text.includes('Choose') && !text.includes('เลือก');
+                    }
+                    return false;
+                default:
+                    return false;
+            }
+        } catch (e) {
+            return false;
         }
     }
 
@@ -397,56 +457,91 @@
         
         try {
             log('Scraping questions...', 'info');
-            state.questions = scrapeQuestions();
-            log(`Found ${state.questions.length} questions`, 'success');
+            const allQuestions = scrapeQuestions();
             
-            if (state.questions.length === 0) {
-                log('No questions found!', 'error');
+            const questionsToFill = allQuestions.filter((q, i) => {
+                if (CONFIG.ONLY_FILL_EMPTY && checkAnswered(q)) {
+                    log(`Skipping Q${i + 1}: Already answered`, 'info');
+                    return false;
+                }
+                return true;
+            });
+
+            state.questions = allQuestions;
+            log(`Found ${allQuestions.length} total, filling ${questionsToFill.length}`, 'success');
+            
+            if (questionsToFill.length === 0) {
+                log('Nothing to fill!', 'error');
                 state.isRunning = false;
                 updateButtonsUI();
                 return;
             }
-            
-            for (let i = 0; i < state.questions.length; i++) {
+
+            let currentBatchSize = CONFIG.INITIAL_BATCH_SIZE || 10;
+            const maxBatchSize = CONFIG.MAX_BATCH_SIZE || 20;
+
+            let i = 0;
+            while (i < questionsToFill.length) {
                 if (state.shouldCancel) {
-                    log('Auto-fill stopped by user.', 'error');
+                    log('Stopped by user.', 'error');
                     break;
                 }
 
-                const question = state.questions[i];
+                const batchSize = Math.min(currentBatchSize, questionsToFill.length - i);
+                const batch = questionsToFill.slice(i, i + batchSize);
+                const batchIndices = batch.map(q => q.index + 1).join(', ');
                 
-                if (CONFIG.ONLY_FILL_EMPTY && checkAnswered(question)) {
-                    log(`Skipping Q${i + 1}: Already answered`, 'info');
-                    continue;
-                }
-
-                state.currentQuestion = i;
-                updateProgressUI();
-                
-                log(`Processing Q${i + 1}/${state.questions.length}`, 'info');
+                log(`Processing Batch (Size: ${batchSize}, Qs: ${batchIndices})...`, 'info');
                 
                 try {
-                    const prompt = buildPrompt(question);
-                    log('Asking AI...', 'info');
-                    const answer = await callGemini(prompt);
-                    log(`AI: ${answer.substring(0, 80)}`, 'success');
+                    const answers = await callGeminiBatch(batch);
                     
-                    if (state.shouldCancel) break;
-                    await fillQuestion(question, answer);
+                    // On success: maybe grow batch size for next time
+                    for (let j = 0; j < batch.length; j++) {
+                        if (state.shouldCancel) break;
+                        const question = batch[j];
+                        const answer = answers[j];
+                        
+                        if (answer) {
+                            state.currentQuestion = question.index;
+                            updateProgressUI();
+                            await fillQuestion(question, answer);
+                        }
+                    }
+
+                    i += batch.length; // Advance index
                     
+                    if (currentBatchSize < maxBatchSize) {
+                        currentBatchSize = Math.min(maxBatchSize, currentBatchSize + 2);
+                        if (CONFIG.DEBUG) console.log(`[AI Helper] Scaling up batch size to: ${currentBatchSize}`);
+                    }
+
                 } catch (error) {
-                    if (error.message !== 'Cancelled') {
-                        log(`Error Q${i + 1}: ${error.message}`, 'error');
+                    if (error.message === 'Cancelled') break;
+                    
+                    log(`Batch failed: ${error.message}. Scaling down...`, 'error');
+                    
+                    // On error: scale down batch size and try again with smaller pieces
+                    if (currentBatchSize > 1) {
+                        currentBatchSize = Math.max(1, Math.floor(currentBatchSize / 2));
+                        log(`Reducing batch size to ${currentBatchSize} and retrying...`, 'info');
+                        // Don't advance 'i' so we retry the same questions
+                    } else {
+                        // If it fails even with batch size 1, log error and skip this question to avoid infinite loop
+                        log(`Failed at minimum batch size. Skipping Q${batch[0].index + 1}`, 'error');
+                        i++;
                     }
                 }
                 
                 if (state.shouldCancel) break;
-                await delay(CONFIG.DELAY_BETWEEN_QUESTIONS);
+                if (i < questionsToFill.length) {
+                    log(`Next batch in ${CONFIG.DELAY_BETWEEN_QUESTIONS / 1000}s...`, 'info');
+                    await delay(CONFIG.DELAY_BETWEEN_QUESTIONS);
+                }
             }
             
-            if (!state.shouldCancel) {
-                log('All questions done!', 'success');
-                
+            if (!state.shouldCancel && i >= questionsToFill.length) {
+                log('All tasks done!', 'success');
                 if (CONFIG.AUTO_SUBMIT) {
                     await delay(2000);
                     const submitBtn = document.querySelector('[role="button"][jsname="M2UYVd"]');
@@ -557,12 +652,15 @@
     function updateButtonsUI() {
         const startBtn = document.getElementById('ai-start');
         if (startBtn) {
+            startBtn.disabled = false; // Never disable, so we can click to stop
             if (state.isRunning) {
                 startBtn.textContent = 'Stop / Cancel';
                 startBtn.style.background = '#d93025';
+                startBtn.style.color = 'white';
             } else {
                 startBtn.textContent = 'Start Auto-Fill';
                 startBtn.style.background = '#1a73e8';
+                startBtn.style.color = 'white';
             }
         }
     }
