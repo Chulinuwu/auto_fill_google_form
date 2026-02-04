@@ -1,6 +1,6 @@
 window.FORM_AI_CONFIG = {
     GEMINI_API_KEY: 'GEMINI_API_KEY',
-    GEMINI_MODEL: 'gemini-3-flash-preview',
+    GEMINI_MODEL: 'gemini-2.5-flash',
     ONLY_FILL_EMPTY: true,
     MAX_RETRIES: 5,
     RETRY_DELAY: 5000,

@@ -234,6 +234,8 @@
     }
 
     async function callGemini(prompt, retryCount = 0) {
+        if (state.shouldCancel) throw new Error('Cancelled');
+
         try {
             const response = await fetch(
                 `https://generativelanguage.googleapis.com/v1beta/models/${CONFIG.GEMINI_MODEL}:generateContent?key=${CONFIG.GEMINI_API_KEY}`,
@@ -255,12 +257,13 @@
             );
             
             if (response.status === 429) {
-                if (retryCount < (CONFIG.MAX_RETRIES || 3)) {
+                if (retryCount < (CONFIG.MAX_RETRIES || 3) && !state.shouldCancel) {
                     log(`Rate limited (429). Retrying in ${CONFIG.RETRY_DELAY / 1000}s...`, 'error');
                     await delay(CONFIG.RETRY_DELAY || 5000);
+                    if (state.shouldCancel) throw new Error('Cancelled');
                     return await callGemini(prompt, retryCount + 1);
                 } else {
-                    throw new Error('Rate limit exceeded after multiple retries.');
+                    throw new Error(state.shouldCancel ? 'Cancelled' : 'Rate limit exceeded after multiple retries.');
                 }
             }
 
@@ -272,9 +275,12 @@
             
             throw new Error('Invalid response from Gemini: ' + JSON.stringify(data));
         } catch (error) {
-            if (retryCount < (CONFIG.MAX_RETRIES || 3)) {
+            if (error.message === 'Cancelled') throw error;
+            
+            if (retryCount < (CONFIG.MAX_RETRIES || 3) && !state.shouldCancel) {
                 log(`Error: ${error.message}. Retrying...`, 'error');
                 await delay(CONFIG.RETRY_DELAY || 5000);
+                if (state.shouldCancel) throw new Error('Cancelled');
                 return await callGemini(prompt, retryCount + 1);
             }
             throw error;
@@ -429,9 +435,12 @@
                     await fillQuestion(question, answer);
                     
                 } catch (error) {
-                    log(`Error Q${i + 1}: ${error.message}`, 'error');
+                    if (error.message !== 'Cancelled') {
+                        log(`Error Q${i + 1}: ${error.message}`, 'error');
+                    }
                 }
                 
+                if (state.shouldCancel) break;
                 await delay(CONFIG.DELAY_BETWEEN_QUESTIONS);
             }
             
