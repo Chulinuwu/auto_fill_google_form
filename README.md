@@ -29,6 +29,7 @@ A lightweight browser console tool to automatically answer Google Forms using Ge
 In `google-forms-config.js`, you can adjust:
 
 - `GEMINI_MODEL`: The model version to use (default: `gemini-3-flash-preview`).
+- `ONLY_FILL_EMPTY`: Set to `true` to only fill questions that are currently empty/unselected (default: `false`).
 - `DELAY_BETWEEN_QUESTIONS`: Milliseconds to wait between questions (default: `1500`).
 - `AUTO_SUBMIT`: Set to `true` to automatically click the submit button after filling (default: `false`).
 - `DEBUG`: Set to `false` to hide console logs (default: `true`).

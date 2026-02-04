@@ -136,6 +136,7 @@
 
     let state = {
         isRunning: false,
+        shouldCancel: false,
         questions: [],
         currentQuestion: 0,
         logs: []
@@ -338,13 +339,35 @@
         }
     }
 
+    function checkAnswered(question) {
+        switch (question.type) {
+            case 'multiple_choice':
+                return Array.from(question.options).some(opt => opt.element.getAttribute('aria-checked') === 'true');
+            case 'checkbox':
+                return Array.from(question.options).some(opt => opt.element.getAttribute('aria-checked') === 'true');
+            case 'short_answer':
+            case 'paragraph':
+                return question.inputElement && question.inputElement.value.trim() !== '';
+            case 'dropdown':
+                if (question.dropdownElement) {
+                    const selectedValue = question.dropdownElement.getAttribute('data-value');
+                    return selectedValue && selectedValue !== '';
+                }
+                return false;
+            default:
+                return false;
+        }
+    }
+
     async function startAutoFill() {
         if (state.isRunning) {
-            log('Already running!', 'error');
+            state.shouldCancel = true;
+            log('Cancelling...', 'error');
             return;
         }
         
         state.isRunning = true;
+        state.shouldCancel = false;
         updateButtonsUI();
         
         try {
@@ -360,10 +383,21 @@
             }
             
             for (let i = 0; i < state.questions.length; i++) {
+                if (state.shouldCancel) {
+                    log('Auto-fill stopped by user.', 'error');
+                    break;
+                }
+
+                const question = state.questions[i];
+                
+                if (CONFIG.ONLY_FILL_EMPTY && checkAnswered(question)) {
+                    log(`Skipping Q${i + 1}: Already answered`, 'info');
+                    continue;
+                }
+
                 state.currentQuestion = i;
                 updateProgressUI();
                 
-                const question = state.questions[i];
                 log(`Processing Q${i + 1}/${state.questions.length}`, 'info');
                 
                 try {
@@ -372,6 +406,7 @@
                     const answer = await callGemini(prompt);
                     log(`AI: ${answer.substring(0, 80)}`, 'success');
                     
+                    if (state.shouldCancel) break;
                     await fillQuestion(question, answer);
                     
                 } catch (error) {
@@ -381,14 +416,16 @@
                 await delay(CONFIG.DELAY_BETWEEN_QUESTIONS);
             }
             
-            log('All questions done!', 'success');
-            
-            if (CONFIG.AUTO_SUBMIT) {
-                await delay(2000);
-                const submitBtn = document.querySelector('[role="button"][jsname="M2UYVd"]');
-                if (submitBtn) {
-                    submitBtn.click();
-                    log('Form submitted!', 'success');
+            if (!state.shouldCancel) {
+                log('All questions done!', 'success');
+                
+                if (CONFIG.AUTO_SUBMIT) {
+                    await delay(2000);
+                    const submitBtn = document.querySelector('[role="button"][jsname="M2UYVd"]');
+                    if (submitBtn) {
+                        submitBtn.click();
+                        log('Form submitted!', 'success');
+                    }
                 }
             }
             
@@ -397,6 +434,7 @@
         }
         
         state.isRunning = false;
+        state.shouldCancel = false;
         updateButtonsUI();
     }
 
@@ -491,10 +529,13 @@
     function updateButtonsUI() {
         const startBtn = document.getElementById('ai-start');
         if (startBtn) {
-            startBtn.disabled = state.isRunning;
-            startBtn.textContent = state.isRunning 
-                ? 'Processing...' 
-                : 'Start Auto-Fill';
+            if (state.isRunning) {
+                startBtn.textContent = 'Stop / Cancel';
+                startBtn.style.background = '#d93025';
+            } else {
+                startBtn.textContent = 'Start Auto-Fill';
+                startBtn.style.background = '#1a73e8';
+            }
         }
     }
 
@@ -502,3 +543,4 @@
     console.log('Google Forms AI Helper loaded! Panel is on the top-right corner.');
     
 })();
+
