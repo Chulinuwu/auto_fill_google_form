@@ -233,33 +233,52 @@
         return questions;
     }
 
-    async function callGemini(prompt) {
-        const response = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${CONFIG.GEMINI_MODEL}:generateContent?key=${CONFIG.GEMINI_API_KEY}`,
-            {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    contents: [{
-                        parts: [{
-                            text: `You are a helpful assistant. Answer the following question concisely. For multiple choice questions, respond with ONLY the exact text of one correct option. For short answers, give a brief response.\n\nQuestion: ${prompt}`
-                        }]
-                    }],
-                    generationConfig: {
-                        temperature: 0.7,
-                        maxOutputTokens: 500
-                    }
-                })
+    async function callGemini(prompt, retryCount = 0) {
+        try {
+            const response = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/models/${CONFIG.GEMINI_MODEL}:generateContent?key=${CONFIG.GEMINI_API_KEY}`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        contents: [{
+                            parts: [{
+                                text: `You are a helpful assistant. Answer the following question concisely. For multiple choice questions, respond with ONLY the exact text of one correct option. For short answers, give a brief response.\n\nQuestion: ${prompt}`
+                            }]
+                        }],
+                        generationConfig: {
+                            temperature: 0.7,
+                            maxOutputTokens: 500
+                        }
+                    })
+                }
+            );
+            
+            if (response.status === 429) {
+                if (retryCount < (CONFIG.MAX_RETRIES || 3)) {
+                    log(`Rate limited (429). Retrying in ${CONFIG.RETRY_DELAY / 1000}s...`, 'error');
+                    await delay(CONFIG.RETRY_DELAY || 5000);
+                    return await callGemini(prompt, retryCount + 1);
+                } else {
+                    throw new Error('Rate limit exceeded after multiple retries.');
+                }
             }
-        );
-        
-        const data = await response.json();
-        
-        if (data.candidates && data.candidates[0] && data.candidates[0].content) {
-            return data.candidates[0].content.parts[0].text.trim();
+
+            const data = await response.json();
+            
+            if (data.candidates && data.candidates[0] && data.candidates[0].content) {
+                return data.candidates[0].content.parts[0].text.trim();
+            }
+            
+            throw new Error('Invalid response from Gemini: ' + JSON.stringify(data));
+        } catch (error) {
+            if (retryCount < (CONFIG.MAX_RETRIES || 3)) {
+                log(`Error: ${error.message}. Retrying...`, 'error');
+                await delay(CONFIG.RETRY_DELAY || 5000);
+                return await callGemini(prompt, retryCount + 1);
+            }
+            throw error;
         }
-        
-        throw new Error('Invalid response from Gemini: ' + JSON.stringify(data));
     }
 
     function buildPrompt(question) {
